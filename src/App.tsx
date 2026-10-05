@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import {
   ActionIcon,
   AppShell,
@@ -32,6 +32,7 @@ import {
 import {
   IconAlertTriangle,
   IconAnchor,
+  IconBiohazard,
   IconBoxMultiple,
   IconCheck,
   IconCube,
@@ -49,26 +50,36 @@ import {
   IconUsers
 } from '@tabler/icons-react';
 import * as THREE from 'three';
-import { useGetVoyageQuery, type Cargo, type CargoType } from './api';
+import { useGetVoyageQuery, useImportDgDeclarationsMutation, type Cargo, type CargoType } from './api';
 import {
   acceptComment,
   acceptLimit,
   addComment,
+  applyImportedDeclarations,
   calculateStability,
+  clearRejection,
   detectConflicts,
   lockPlan,
   moveCargo,
+  recordImportFailure,
   rejectComment,
+  segregationClear,
   selectCargo,
+  setOfficer,
   setViewMode,
   store,
+  updateDeclarationUn,
   updateLashing,
+  upgradeDeclaration,
+  OFFICERS,
   type RootState
 } from './store';
+import { DG_CLASSES, DG_ZONE, LEVEL_LABELS, UN_TABLE, requiredLevel } from './dg';
 
 const nav = [
   { path: '/', label: '航次总览', icon: <IconShip size={17} /> },
   { path: '/stowage', label: '配载与货位', icon: <IconLayoutBoardSplit size={17} /> },
+  { path: '/segregation', label: '危险品隔离', icon: <IconBiohazard size={17} /> },
   { path: '/compare', label: '方案对比', icon: <IconHistory size={17} /> },
   { path: '/print', label: '配载图与清单', icon: <IconPrinter size={17} /> }
 ];
@@ -223,10 +234,14 @@ function Overview() {
   const dispatch = useDispatch();
   const stability = calculateStability(state.cargo);
   const conflicts = detectConflicts(state.cargo);
+  const segClear = segregationClear(state);
+  const segConflicts = Object.values(state.segregation).filter((entry) => entry.verdict.status === '冲突').length;
+  const pendingUpgrade = state.declarations.filter((d) => d.status === '待补齐').length;
   const active = state.cargo.find((item) => item.id === state.activeCargoId) ?? state.cargo[0];
   return <div className="page">
-    <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || state.locked} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : '锁定配载版本'}</Button></>} />
+    <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || !segClear || state.locked} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : '锁定配载版本'}</Button></>} />
     {conflicts.length > 0 && <div className="warning-banner"><IconAlertTriangle size={18} /><strong>{conflicts.length} 项配载冲突待处理</strong><span>{conflicts.map((item) => item.title).join('、')}</span></div>}
+    {!segClear && <div className="warning-banner seg-banner"><IconBiohazard size={18} /><strong>危险品隔离未清干净，不能锁定和打印</strong><span>{[segConflicts > 0 && `${segConflicts} 箱隔离冲突`, state.dgQueue.length > 0 && `${state.dgQueue.length} 箱排队等位`, pendingUpgrade > 0 && `${pendingUpgrade} 份申报待补齐`].filter(Boolean).join(' · ')}</span><Button size="compact-xs" variant="light" color="orange" component={Link} to="/segregation">去处理</Button></div>}
     <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="sm" mb="md">{[
       ['总货重', `${stability.total.toFixed(1)} t`, '设计上限 3560 t', 'ok'],
       ['稳性裕度', `${stability.stability.toFixed(1)}%`, stability.stability > 70 ? '符合航次要求' : '低于控制线', stability.stability > 70 ? 'ok' : 'bad'],
@@ -258,16 +273,112 @@ function Stowage() {
   useEffect(() => { setBay(active.bay); setRow(active.row); setTier(active.tier); }, [active.bay, active.row, active.tier]);
   const slots = useMemo(() => Array.from({ length: 28 }).map((_, index) => ({ id: `slot-${index}`, bay: 4 + Math.floor(index / 4), row: index % 4, tier: 0, label: `B${4 + Math.floor(index / 4)} R${index % 4}` })), []);
   return <div className="page">
-    <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge>} />
+    <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<><Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge><Badge size="lg" color={segregationClear(state) ? 'teal' : 'red'} leftSection={<IconBiohazard size={14} />}>{segregationClear(state) ? '隔离已清' : '隔离未清'}</Badge></>} />
     <div className="stowage-grid">
       <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></button>)}</div></ScrollArea></Card>
       <Card padding={0} className="deck-panel"><div className="panel-title"><div><strong>主甲板货位图</strong><Text size="xs" c="dimmed">将货物拖入槽位，或点击槽位选择</Text></div><Group gap="xs"><Badge color="teal">稳性 {stability.stability.toFixed(1)}%</Badge><Badge color="gray">{stability.trim}</Badge></Group></div><div className="deck-layout"><div className="bridge-shape">驾驶台</div><div className="slot-grid">{slots.map((slot) => { const occupied = state.cargo.find((item) => item.deck === '主甲板' && item.bay === slot.bay && item.row === slot.row); return <button key={slot.id} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragId) dispatch(moveCargo({ id: dragId, bay: slot.bay, row: slot.row, tier: occupied?.tier ?? 1 })); setDragId(null); }} className={occupied ? 'occupied' : ''} style={occupied ? { background: occupied.color } : undefined} onClick={() => { if (occupied) { dispatch(selectCargo(occupied.id)); setRow(slot.row); setBay(slot.bay); } }}><small>{slot.label}</small>{occupied && <strong>{occupied.bill.slice(-3)}<span>{occupied.weight}t</span></strong>}</button>; })}</div><div className="deck-axis">左舷 ← 横向 Row → 右舷</div></div></Card>
       <Stack gap="sm">
-        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo({ id: active.id, bay, row, tier }))}>应用货位调整</Button><Divider /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing({ id: active.id, lashing: value as Cargo['lashing'] }))} /></Stack></Card>
+        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo({ id: active.id, bay, row, tier }))}>应用货位调整</Button><Text size="xs" c="dimmed">以 {state.currentOfficer} 身份调整，目标货位随即占用；他人已占用的货位会被拒绝并留冲突。</Text><Divider /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing({ id: active.id, lashing: value as Cargo['lashing'] }))} /></Stack></Card>
         <Card padding="md" className={conflicts.length ? 'conflict-card' : ''}><div className="panel-title"><div><strong>实时冲突</strong><Text size="xs" c="dimmed">重心、稳性、隔离与堆码</Text></div><IconAlertTriangle size={18} /></div>{conflicts.map((item) => <button className="conflict-row" key={item.id} onClick={() => dispatch(selectCargo(item.cargoId))}><Badge size="xs" color={item.level === 'high' ? 'red' : 'orange'}>{item.level === 'high' ? '阻断' : '预警'}</Badge><div><strong>{item.title}</strong><span>{item.detail}</span></div></button>)}{!conflicts.length && <Text size="sm" c="teal" mt="md">当前方案未发现冲突。</Text>}</Card>
       </Stack>
     </div>
     <Card padding="md" mt="md"><div className="panel-title"><div><strong>角色条件与审批</strong><Text size="xs" c="dimmed">船长、码头和货主代表可对方案提出限制</Text></div><IconUsers size={18} /></div><div className="comments-grid">{state.comments.map((item) => <div className="comment-card" key={item.id}><Group justify="space-between"><Badge size="xs">{item.role}</Badge><Text size="xs" c="dimmed">{item.author}</Text></Group><Text size="sm" mt="xs">{item.content}</Text><Group gap="xs" mt="sm"><Button size="compact-xs" color="teal" disabled={item.status !== '待确认'} onClick={() => dispatch(acceptComment(item.id))}>接受</Button><Button size="compact-xs" variant="default" disabled={item.status !== '待确认'} onClick={() => dispatch(rejectComment(item.id))}>退回</Button></Group></div>)}</div><Group mt="md" align="flex-start"><Textarea flex={1} minRows={2} placeholder="输入新的限制条件或调整意见" value={comment} onChange={(event) => setComment(event.currentTarget.value)} /><Button color="teal" onClick={() => { if (comment.trim()) { dispatch(addComment({ cargoId: active.id, author: '本次负责人', role: '船长', content: comment })); setComment(''); } }}>提交条件</Button></Group></Card>
+  </div>;
+}
+
+function Segregation() {
+  const state = useSelector((root: RootState) => root.stowage);
+  const dispatch = useDispatch();
+  const [importDg, importMeta] = useImportDgDeclarationsMutation();
+  const [upgradeSel, setUpgradeSel] = useState<Record<string, string>>({});
+  const declRows = state.declarations.flatMap((decl) => {
+    const cargo = state.cargo.find((item) => item.id === decl.cargoId);
+    return cargo ? [{ decl, cargo }] : [];
+  });
+  const pendingUpgrade = declRows.filter((row) => row.decl.status === '待补齐');
+  const clear = segregationClear(state);
+  const maxLevel = (cargoId: string) => {
+    const decl = state.declarations.find((item) => item.cargoId === cargoId);
+    if (!decl || decl.status !== '有效') return 0;
+    return Math.max(0, ...state.declarations.filter((item) => item.cargoId !== cargoId && item.status === '有效').map((item) => requiredLevel(decl.dgClass, item.dgClass)));
+  };
+  const unOptions = (current: string) => {
+    const base = Object.entries(UN_TABLE).map(([un, info]) => ({ value: un, label: `UN ${un} · ${info.name}（${info.dgClass} 类）` }));
+    if (current && !UN_TABLE[current]) return [...base, { value: current, label: `UN ${current} · 未收录（需补齐类别）` }];
+    return base;
+  };
+  const doImport = () => {
+    importDg().unwrap()
+      .then((payload) => dispatch(applyImportedDeclarations(payload)))
+      .catch((error: unknown) => {
+        const message = typeof error === 'object' && error !== null && 'data' in error ? String((error as { data: unknown }).data) : '码头接口异常';
+        dispatch(recordImportFailure(message));
+      });
+  };
+  const verdictColor = (status?: string) => status === '通过' ? 'teal' : status === '冲突' ? 'red' : status === '排队中' ? 'orange' : 'gray';
+  return <div className="page">
+    <PageHeading eyebrow="DG DECLARATION / SEGREGATION" title="危险品申报与隔离校核" description="申报、货物与货位联动：按 UN 号取类别与隔离等级，比对同舱、相邻层与上下层货位。" actions={<Badge size="lg" color={clear ? 'teal' : 'red'} leftSection={<IconBiohazard size={14} />}>{clear ? '隔离已清' : '隔离未清'}</Badge>} />
+    {pendingUpgrade.length > 0 && <div className="warning-banner"><IconAlertTriangle size={18} /><strong>{pendingUpgrade.length} 份申报缺危险品类别</strong><span>旧稿或导入申报升级补齐后才能重排货位。</span></div>}
+    <div className="seg-grid">
+      <Card padding={0}>
+        <div className="panel-title"><div><strong>危险品申报</strong><Text size="xs" c="dimmed">改动 UN 号即触发受影响箱重算，无关箱沿用原结论</Text></div><IconBiohazard size={18} /></div>
+        <Table verticalSpacing="sm">
+          <Table.Thead><Table.Tr><Table.Th>货物 / 货位</Table.Th><Table.Th>UN 号</Table.Th><Table.Th>类别</Table.Th><Table.Th>隔离等级</Table.Th><Table.Th>来源</Table.Th><Table.Th>状态</Table.Th></Table.Tr></Table.Thead>
+          <Table.Tbody>{declRows.map(({ decl, cargo }) => <Table.Tr key={decl.id}>
+            <Table.Td><Text fw={700} size="sm">{cargo.bill}</Text><Text size="xs" c="dimmed">{cargo.deck} B{cargo.bay}/R{cargo.row}/T{cargo.tier}</Text></Table.Td>
+            <Table.Td><Select size="xs" data={unOptions(decl.un)} value={decl.un} disabled={state.locked} onChange={(value) => value && dispatch(updateDeclarationUn({ cargoId: cargo.id, un: value }))} /></Table.Td>
+            <Table.Td>{decl.status === '待补齐'
+              ? <Group gap={6} wrap="nowrap"><Select size="xs" placeholder="补齐类别" data={DG_CLASSES} value={upgradeSel[cargo.id] ?? null} onChange={(value) => setUpgradeSel({ ...upgradeSel, [cargo.id]: value ?? '' })} /><Button size="compact-xs" color="teal" disabled={!upgradeSel[cargo.id]} onClick={() => dispatch(upgradeDeclaration({ cargoId: cargo.id, dgClass: upgradeSel[cargo.id] }))}>补齐</Button></Group>
+              : <Badge variant="light" color="orange">{decl.dgClass} 类</Badge>}</Table.Td>
+            <Table.Td><Text size="xs">{decl.status === '有效' ? LEVEL_LABELS[maxLevel(cargo.id)] : '—'}</Text></Table.Td>
+            <Table.Td><Text size="xs">{decl.source}</Text><Text size="xs" c="dimmed">{decl.updatedAt}</Text></Table.Td>
+            <Table.Td><Badge size="xs" color={decl.status === '有效' ? 'teal' : 'orange'}>{decl.status}</Badge></Table.Td>
+          </Table.Tr>)}</Table.Tbody>
+        </Table>
+      </Card>
+      <Stack gap="sm">
+        <Card padding="md">
+          <div className="panel-title"><div><strong>危险品货位容量</strong><Text size="xs" c="dimmed">{DG_ZONE.label} · 容量 {DG_ZONE.capacity} 箱</Text></div><Badge color={state.dgQueue.length ? 'orange' : 'teal'}>{state.dgOccupants.length}/{DG_ZONE.capacity}</Badge></div>
+          <Progress value={(state.dgOccupants.length / DG_ZONE.capacity) * 100} color={state.dgQueue.length ? 'orange' : 'teal'} size="sm" mt="sm" />
+          <div className="dg-zone">{state.dgOccupants.map((id) => <Badge key={id} variant="light" color="orange">{id}</Badge>)}</div>
+          {state.dgQueue.map((item) => <div className="limit-row" key={item.cargoId}><div><Text size="xs" fw={700}>{item.cargoId} 排队中</Text><Text size="xs" c="dimmed">{item.reason} · 占用者：{item.occupiers.join('、') || '—'}</Text></div><Badge size="xs" color="orange">{item.at}</Badge></div>)}
+          {!state.dgQueue.length && <Text size="xs" c="teal" mt="xs">容量充足，无排队。</Text>}
+        </Card>
+        <Card padding="md">
+          <div className="panel-title"><div><strong>值班员与货位占用</strong><Text size="xs" c="dimmed">同一货位先到者占用，后到者留冲突</Text></div><IconUsers size={18} /></div>
+          <Select size="xs" mt="sm" label="当前值班员" data={OFFICERS} value={state.currentOfficer} onChange={(value) => value && dispatch(setOfficer(value))} />
+          {Object.entries(state.slotClaims).map(([key, claim]) => <div className="limit-row" key={key}><div><Text size="xs" fw={700}>{key}</Text><Text size="xs" c="dimmed">{claim.cargoId} · {claim.at}</Text></div><Badge size="xs" color="teal">{claim.officer}</Badge></div>)}
+          {!Object.keys(state.slotClaims).length && <Text size="xs" c="dimmed" mt="xs">暂无货位占用。</Text>}
+          {state.slotConflicts.map((item) => <div className="limit-row" key={item.id}><div><Text size="xs" fw={700} c="red">{item.slotKey} 修改冲突</Text><Text size="xs" c="dimmed">{item.challenger}（{item.challengerCargo}）被占用者 {item.holder}（{item.holderCargo}）拒绝 · {item.at}</Text></div></div>)}
+        </Card>
+      </Stack>
+    </div>
+    <div className="seg-grid">
+      <Card padding="md">
+        <div className="panel-title"><div><strong>隔离校核结论</strong><Text size="xs" c="dimmed">{state.lastRecompute ? `${state.lastRecompute.at} · ${state.lastRecompute.reason}：重算 ${state.lastRecompute.recomputed} 箱 · 沿用 ${state.lastRecompute.reused} 箱` : '尚未校核'}</Text></div><Badge color={clear ? 'teal' : 'red'}>{clear ? '全部通过' : '存在未清项'}</Badge></div>
+        {declRows.map(({ decl, cargo }) => {
+          const verdict = state.segregation[cargo.id]?.verdict;
+          return <div className="verdict-row" key={decl.id}>
+            <div><strong>{cargo.bill} · {decl.dgClass ? `${decl.dgClass} 类` : '类别待定'}</strong>
+              <span>{verdict?.conflicts.length ? verdict.conflicts.map((item) => `与 ${item.withId}：${item.relation}，要求${item.required}`).join('；') : verdict?.status === '排队中' ? (state.dgQueue.find((item) => item.cargoId === cargo.id)?.reason ?? '排队中') : '无隔离冲突'} · 校核于 {verdict?.computedAt ?? '—'}</span></div>
+            <Badge color={verdictColor(verdict?.status)}>{verdict?.status ?? '—'}</Badge>
+          </div>;
+        })}
+        <Divider my="sm" />
+        <Text size="xs" c="dimmed">稳性结论：裕度 {state.stabilityConclusion.stability.toFixed(1)}% · {state.stabilityConclusion.trim} · 总重 {state.stabilityConclusion.total.toFixed(1)}t · 重算于 {state.stabilityConclusion.computedAt}</Text>
+      </Card>
+      <Stack gap="sm">
+        <Card padding="md">
+          <div className="panel-title"><div><strong>码头申报导入</strong><Text size="xs" c="dimmed">失败时保留原货位和旧申报，可重试</Text></div><IconFileDescription size={18} /></div>
+          <Button mt="sm" color="teal" loading={importMeta.isLoading} onClick={doImport}>{state.importLog[0]?.status === '失败' ? '重试导入码头申报' : '导入码头申报'}</Button>
+          {state.importLog.map((log, index) => <div className="limit-row" key={`${log.at}-${index}`}><div><Text size="xs" fw={700}>{log.status}</Text><Text size="xs" c="dimmed">{log.message}</Text></div><Badge size="xs" color={log.status === '成功' ? 'teal' : 'red'}>{log.at}</Badge></div>)}
+        </Card>
+        <Card padding="md">
+          <div className="panel-title"><div><strong>校核日志</strong><Text size="xs" c="dimmed">失效与重算记录</Text></div><IconHistory size={18} /></div>
+          <div className="audit-list">{state.audit.map((line, index) => <div key={index}>{line}</div>)}</div>
+        </Card>
+      </Stack>
+    </div>
   </div>;
 }
 
@@ -295,8 +406,10 @@ function PrintPlan() {
   const state = useSelector((root: RootState) => root.stowage);
   const stability = calculateStability(state.cargo);
   const dispatch = useDispatch();
+  const clear = segregationClear(state);
   return <div className="page print-page">
-    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} onClick={() => window.print()}>打印配载包</Button></>} />
+    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} disabled={!clear} onClick={() => window.print()}>打印配载包</Button></>} />
+    {!clear && <div className="warning-banner"><IconBiohazard size={18} /><strong>危险品隔离未清干净，不能打印配载包</strong><span>请先在「危险品隔离」页处理冲突、排队与待补齐申报。</span></div>}
     <Card padding="xl" className="print-sheet">
       <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />已校核</div></div>
       <div className="print-kpis"><div><span>总货重</span><strong>{stability.total.toFixed(1)} t</strong></div><div><span>稳性裕度</span><strong>{stability.stability.toFixed(1)}%</strong></div><div><span>纵倾</span><strong>{stability.trim}</strong></div><div><span>主甲板载荷</span><strong>{stability.deckLoad.toFixed(1)} t</strong></div></div>
@@ -312,13 +425,14 @@ function PrintPlan() {
 function Shell({ children }: { children: ReactNode }) {
   const state = useSelector((root: RootState) => root.stowage);
   const stability = calculateStability(state.cargo);
+  const dispatch = useDispatch();
   return <AppShell header={{ height: 62 }} navbar={{ width: 224, breakpoint: 'sm' }} padding={0}>
-    <AppShellHeader className="app-header"><Group h="100%" px="md" justify="space-between"><Group gap="sm"><ThemeIcon color="teal" variant="light"><IconShip size={19} /></ThemeIcon><div className="brand-copy"><strong>船舶配载校核台</strong><span>Stowage & Voyage Review</span></div></Group><Group gap="sm" visibleFrom="sm"><Badge variant="light" color="teal">海岳轮</Badge><Text size="xs" c="dimmed">V-2609-17 · 方案 V{state.planRevision}</Text><Badge color={state.locked ? 'teal' : 'orange'}>{state.locked ? '已锁定' : '审阅中'}</Badge></Group><ActionIcon variant="subtle" color="gray"><IconAnchor size={18} /></ActionIcon></Group></AppShellHeader>
+    <AppShellHeader className="app-header"><Group h="100%" px="md" justify="space-between"><Group gap="sm"><ThemeIcon color="teal" variant="light"><IconShip size={19} /></ThemeIcon><div className="brand-copy"><strong>船舶配载校核台</strong><span>Stowage & Voyage Review</span></div></Group><Group gap="sm" visibleFrom="sm"><Badge variant="light" color="teal">海岳轮</Badge><Text size="xs" c="dimmed">V-2609-17 · 方案 V{state.planRevision}</Text><Select size="xs" w={128} data={OFFICERS} value={state.currentOfficer} onChange={(value) => value && dispatch(setOfficer(value))} /><Badge color={state.locked ? 'teal' : 'orange'}>{state.locked ? '已锁定' : '审阅中'}</Badge></Group><ActionIcon variant="subtle" color="gray"><IconAnchor size={18} /></ActionIcon></Group></AppShellHeader>
     <AppShellNavbar p="xs" className="app-nav"><div className="voyage-card"><Text size="xs" c="dimmed">当前航次</Text><Text fw={800}>上海 → 温哥华</Text><Text size="xs" c="dimmed">经停釜山 · 10-02 离港</Text><Progress value={stability.stability} color={stability.stability > 70 ? 'teal' : 'orange'} size="sm" mt="sm" /><Text size="xs" mt={4}>稳性裕度 {stability.stability.toFixed(1)}%</Text></div>{nav.map((item) => <NavLink end={item.path === '/'} key={item.path} to={item.path}>{item.icon}<span>{item.label}</span></NavLink>)}<div className="nav-foot"><IconRoute size={16} /><Text size="xs">基线：方案 V4<br />草稿：{state.draftSavedAt} 自动保存</Text></div></AppShellNavbar>
-    <AppShellMain>{children}</AppShellMain>
+    <AppShellMain>{state.lastRejection && <div className="rejection-banner"><IconAlertTriangle size={15} /><span>{state.lastRejection}</span><button onClick={() => dispatch(clearRejection())}>知道了</button></div>}{children}</AppShellMain>
   </AppShell>;
 }
 
 export default function App() {
-  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/compare" element={<Compare />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
+  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/segregation" element={<Segregation />} /><Route path="/compare" element={<Compare />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
 }

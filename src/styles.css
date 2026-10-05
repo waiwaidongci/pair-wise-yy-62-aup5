@@ -132,6 +132,23 @@ body { margin: 0; min-width: 320px; background: #eef2f0; }
   .print-deck, .mini-deck { grid-template-columns: repeat(4, 1fr); }
 }
 
+.seg-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 14px; align-items: start; margin-bottom: 14px; }
+.seg-banner { color: #8a4a12; background: #fff3e6; border-color: #f0c9a0; }
+.seg-banner .mantine-Button-root { margin-left: auto; }
+.verdict-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 10px 0; border-top: 1px solid #edf1ef; }
+.verdict-row strong, .verdict-row span { display: block; }
+.verdict-row strong { font-size: 12px; }
+.verdict-row span { color: var(--muted); font-size: 10px; margin-top: 3px; line-height: 1.5; }
+.dg-zone { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.audit-list { max-height: 300px; overflow: auto; }
+.audit-list div { padding: 7px 0; border-top: 1px solid #edf1ef; font-size: 11px; color: #4c6159; line-height: 1.5; }
+.rejection-banner { display: flex; align-items: center; gap: 8px; background: #fdeeee; color: #8f3532; border-bottom: 1px solid #f0c9c6; padding: 8px 26px; font-size: 12px; }
+.rejection-banner button { margin-left: auto; border: 1px solid #d9a3a0; background: white; color: #8f3532; border-radius: 4px; padding: 2px 12px; font-size: 11px; cursor: pointer; }
+
+@media (max-width: 1100px) {
+  .seg-grid { grid-template-columns: 1fr; }
+}
+
 @media print {
   .app-header, .app-nav, .page-heading, .mantine-AppShell-navbar, .mantine-AppShell-header { display: none !important; }
   .page { padding: 0; max-width: none; }
