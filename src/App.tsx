@@ -3,6 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import {
   ActionIcon,
+  Alert,
   AppShell,
   AppShellHeader,
   AppShellMain,
@@ -32,13 +33,18 @@ import {
 import {
   IconAlertTriangle,
   IconAnchor,
+  IconArrowsExchange,
   IconBoxMultiple,
   IconCheck,
+  IconCircleCheck,
+  IconClockHour4,
   IconCube,
   IconFileDescription,
+  IconFileImport,
   IconHistory,
   IconLayoutBoardSplit,
   IconLock,
+  IconLockOpen,
   IconMap2,
   IconPlayerPlay,
   IconPrinter,
@@ -46,22 +52,31 @@ import {
   IconRulerMeasure,
   IconRoute,
   IconShip,
-  IconUsers
+  IconUserCheck,
+  IconUsers,
+  IconX
 } from '@tabler/icons-react';
 import * as THREE from 'three';
-import { useGetVoyageQuery, type Cargo, type CargoType } from './api';
+import { useGetVoyageQuery, useImportDeclarationMutation, DG_CAPACITY_PER_HOLD, UN_TABLE, type Cargo, type CargoType, type SegRelation } from './api';
 import {
   acceptComment,
   acceptLimit,
+  acknowledgeConflict,
   addComment,
   calculateStability,
+  cancelQueue,
+  clearImportNotice,
   detectConflicts,
   lockPlan,
   moveCargo,
   rejectComment,
+  releaseClaim,
   selectCargo,
   setViewMode,
+  simulateConcurrentEdit,
   store,
+  supplementCategory,
+  updateDeclaration,
   updateLashing,
   type RootState
 } from './store';
@@ -69,6 +84,7 @@ import {
 const nav = [
   { path: '/', label: '航次总览', icon: <IconShip size={17} /> },
   { path: '/stowage', label: '配载与货位', icon: <IconLayoutBoardSplit size={17} /> },
+  { path: '/dg', label: '隔离校核', icon: <IconAlertTriangle size={17} /> },
   { path: '/compare', label: '方案对比', icon: <IconHistory size={17} /> },
   { path: '/print', label: '配载图与清单', icon: <IconPrinter size={17} /> }
 ];
@@ -222,7 +238,7 @@ function Overview() {
   const { data } = useGetVoyageQuery();
   const dispatch = useDispatch();
   const stability = calculateStability(state.cargo);
-  const conflicts = detectConflicts(state.cargo);
+  const conflicts = detectConflicts(state.cargo, state.declarations, state.queue, state.conclusions);
   const active = state.cargo.find((item) => item.id === state.activeCargoId) ?? state.cargo[0];
   return <div className="page">
     <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || state.locked} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : '锁定配载版本'}</Button></>} />
@@ -248,7 +264,7 @@ function Stowage() {
   const state = useSelector((root: RootState) => root.stowage);
   const dispatch = useDispatch();
   const active = state.cargo.find((item) => item.id === state.activeCargoId) ?? state.cargo[0];
-  const conflicts = detectConflicts(state.cargo);
+  const conflicts = detectConflicts(state.cargo, state.declarations, state.queue, state.conclusions);
   const stability = calculateStability(state.cargo);
   const [bay, setBay] = useState(active.bay);
   const [row, setRow] = useState(active.row);
@@ -259,16 +275,211 @@ function Stowage() {
   const slots = useMemo(() => Array.from({ length: 28 }).map((_, index) => ({ id: `slot-${index}`, bay: 4 + Math.floor(index / 4), row: index % 4, tier: 0, label: `B${4 + Math.floor(index / 4)} R${index % 4}` })), []);
   return <div className="page">
     <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge>} />
+    {state.importNotice && <Alert color={state.importNotice.kind === 'failed' ? 'red' : state.importNotice.kind === 'draft' ? 'orange' : state.importNotice.kind === 'ok' ? 'teal' : 'blue'} variant="light" icon={<IconAlertTriangle size={16} />} withCloseButton onClose={() => dispatch(clearImportNotice())} mb="md">{state.importNotice.message}</Alert>}
     <div className="stowage-grid">
-      <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></button>)}</div></ScrollArea></Card>
+      <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Group gap={4} wrap="nowrap">{item.claimedBy && <Badge size="xs" color="red" variant="light">占用</Badge>}<Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></Group></button>)}</div></ScrollArea></Card>
       <Card padding={0} className="deck-panel"><div className="panel-title"><div><strong>主甲板货位图</strong><Text size="xs" c="dimmed">将货物拖入槽位，或点击槽位选择</Text></div><Group gap="xs"><Badge color="teal">稳性 {stability.stability.toFixed(1)}%</Badge><Badge color="gray">{stability.trim}</Badge></Group></div><div className="deck-layout"><div className="bridge-shape">驾驶台</div><div className="slot-grid">{slots.map((slot) => { const occupied = state.cargo.find((item) => item.deck === '主甲板' && item.bay === slot.bay && item.row === slot.row); return <button key={slot.id} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragId) dispatch(moveCargo({ id: dragId, bay: slot.bay, row: slot.row, tier: occupied?.tier ?? 1 })); setDragId(null); }} className={occupied ? 'occupied' : ''} style={occupied ? { background: occupied.color } : undefined} onClick={() => { if (occupied) { dispatch(selectCargo(occupied.id)); setRow(slot.row); setBay(slot.bay); } }}><small>{slot.label}</small>{occupied && <strong>{occupied.bill.slice(-3)}<span>{occupied.weight}t</span></strong>}</button>; })}</div><div className="deck-axis">左舷 ← 横向 Row → 右舷</div></div></Card>
       <Stack gap="sm">
-        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo({ id: active.id, bay, row, tier }))}>应用货位调整</Button><Divider /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing({ id: active.id, lashing: value as Cargo['lashing'] }))} /></Stack></Card>
+        <Card padding="md"><div className="panel-title"><div><strong>精确调整</strong><Text size="xs" c="dimmed">{active.id}</Text></div><IconCube size={18} /></div><Stack gap="sm" mt="md"><NumberInput label="Bay 纵向货位" min={1} max={20} value={bay} onChange={(value) => setBay(Number(value))} /><NumberInput label="Row 横向货位" min={0} max={8} value={row} onChange={(value) => setRow(Number(value))} /><NumberInput label="Tier 堆码层" min={0} max={4} value={tier} onChange={(value) => setTier(Number(value))} /><Button color="teal" onClick={() => dispatch(moveCargo({ id: active.id, bay, row, tier }))}>应用货位调整</Button>{active.hazmat !== '无' && (() => { const d = state.declarations.find((x) => x.id === active.declarationId); return d?.status === '缺类别' ? <Alert color="orange" variant="light" icon={<IconAlertTriangle size={14} />}>旧稿缺危险品类别，补齐后才能重排。<Select size="xs" mt={6} data={['1', '2.1', '3', '4.1', '5.1', '6.1', '7', '8', '9'].map((c) => ({ value: c, label: `${c} 类` }))} placeholder="选择类别补齐" onChange={(v) => v && dispatch(supplementCategory({ cargoId: active.id, category: v }))} /></Alert> : null; })()}<Divider /><Select label="绑扎状态" data={['已绑扎', '待绑扎', '需复核']} value={active.lashing} onChange={(value) => value && dispatch(updateLashing({ id: active.id, lashing: value as Cargo['lashing'] }))} /><Divider /><Group justify="space-between"><Text size="xs" c="dimmed">货位占用者</Text>{active.claimedBy ? <Badge size="xs" color="orange">{active.claimedBy}</Badge> : <Badge size="xs" color="gray">空闲</Badge>}</Group><Button size="xs" variant="default" leftSection={<IconArrowsExchange size={14} />} onClick={() => dispatch(simulateConcurrentEdit(active.id))}>模拟值班员·乙同时修改</Button></Stack></Card>
         <Card padding="md" className={conflicts.length ? 'conflict-card' : ''}><div className="panel-title"><div><strong>实时冲突</strong><Text size="xs" c="dimmed">重心、稳性、隔离与堆码</Text></div><IconAlertTriangle size={18} /></div>{conflicts.map((item) => <button className="conflict-row" key={item.id} onClick={() => dispatch(selectCargo(item.cargoId))}><Badge size="xs" color={item.level === 'high' ? 'red' : 'orange'}>{item.level === 'high' ? '阻断' : '预警'}</Badge><div><strong>{item.title}</strong><span>{item.detail}</span></div></button>)}{!conflicts.length && <Text size="sm" c="teal" mt="md">当前方案未发现冲突。</Text>}</Card>
+        <Card padding="md"><div className="panel-title"><div><strong>排队与并发冲突</strong><Text size="xs" c="dimmed">危险品位排队 · 先到者占用后到者留冲突</Text></div><Group gap={4}><Badge size="xs" color="orange">{state.queue.length} 排队</Badge><Badge size="xs" color="red">{state.concurrency.filter((c) => c.status === '待处理').length} 冲突</Badge></Group></div><Stack gap="xs" mt="xs">{state.queue.map((q) => { const qc = state.cargo.find((c) => c.id === q.cargoId); return <div key={q.id} className="conflict-row" style={{ borderTop: '1px solid #f0dfc5' }}><Badge size="xs" color="orange">排队</Badge><div><strong>{qc?.bill} · {q.hold}</strong><span>占用者：{q.occupantIds.map((oid) => state.cargo.find((c) => c.id === oid)?.bill ?? oid).join('、')}</span></div></div>; })}{state.concurrency.map((cc) => <div key={cc.id} className="conflict-row" style={{ borderTop: '1px solid #f0dfc5' }}><Badge size="xs" color={cc.status === '待处理' ? 'red' : 'gray'}>{cc.status === '待处理' ? '冲突' : '已处理'}</Badge><div><strong>{cc.firstOfficer} 先到 / {cc.secondOfficer} 后到</strong><span>{state.cargo.find((c) => c.id === cc.cargoId)?.bill} · 目标 B{cc.position.bay}/R{cc.position.row}/T{cc.position.tier}</span></div>{cc.status === '待处理' && <Button size="xs" variant="default" onClick={() => dispatch(acknowledgeConflict(cc.id))}>知悉</Button>}</div>)}{!state.queue.length && !state.concurrency.length && <Text size="sm" c="teal" mt="xs">无排队与并发冲突。</Text>}</Stack></Card>
       </Stack>
     </div>
     <Card padding="md" mt="md"><div className="panel-title"><div><strong>角色条件与审批</strong><Text size="xs" c="dimmed">船长、码头和货主代表可对方案提出限制</Text></div><IconUsers size={18} /></div><div className="comments-grid">{state.comments.map((item) => <div className="comment-card" key={item.id}><Group justify="space-between"><Badge size="xs">{item.role}</Badge><Text size="xs" c="dimmed">{item.author}</Text></Group><Text size="sm" mt="xs">{item.content}</Text><Group gap="xs" mt="sm"><Button size="compact-xs" color="teal" disabled={item.status !== '待确认'} onClick={() => dispatch(acceptComment(item.id))}>接受</Button><Button size="compact-xs" variant="default" disabled={item.status !== '待确认'} onClick={() => dispatch(rejectComment(item.id))}>退回</Button></Group></div>)}</div><Group mt="md" align="flex-start"><Textarea flex={1} minRows={2} placeholder="输入新的限制条件或调整意见" value={comment} onChange={(event) => setComment(event.currentTarget.value)} /><Button color="teal" onClick={() => { if (comment.trim()) { dispatch(addComment({ cargoId: active.id, author: '本次负责人', role: '船长', content: comment })); setComment(''); } }}>提交条件</Button></Group></Card>
   </div>;
+}
+
+function DgPage() {
+  const state = useSelector((root: RootState) => root.stowage);
+  const dispatch = useDispatch();
+  const [importDecl, { isLoading: importing }] = useImportDeclarationMutation();
+  const [importCargoId, setImportCargoId] = useState(state.activeCargoId);
+  const [importUn, setImportUn] = useState('UN 1203');
+
+  const cargo = state.cargo;
+  const declarations = state.declarations;
+  const conclusions = state.conclusions;
+  const dgCargo = cargo.filter((c) => c.declarationId);
+  const segIssues = dgCargo.flatMap((c) => conclusions[c.id]?.segregation.issues ?? []);
+  const maxLevel = dgCargo.reduce((m, c) => Math.max(m, conclusions[c.id]?.segregation.level ?? 0), 0);
+  const queueCount = state.queue.length;
+  const active = cargo.find((c) => c.id === state.activeCargoId) ?? cargo[0];
+
+  const holds = Array.from(new Set(cargo.map((c) => c.hold)));
+  const holdRows = holds.map((hold) => {
+    const items = cargo.filter((c) => c.declarationId && c.hold === hold);
+    return { hold, items };
+  });
+
+  const notice = state.importNotice;
+  const noticeColor = notice?.kind === 'failed' ? 'red' : notice?.kind === 'draft' ? 'orange' : notice?.kind === 'ok' ? 'teal' : 'blue';
+
+  const categoryOptions = ['1', '2.1', '3', '4.1', '5.1', '6.1', '7', '8', '9'].map((c) => ({ value: c, label: `${c} 类` }));
+  const unOptions = Object.keys(UN_TABLE).map((u) => ({ value: u, label: `${u} · ${UN_TABLE[u].name}` }));
+  const cargoOptions = cargo.map((c) => ({ value: c.id, label: `${c.bill} · ${c.id}（${c.hold}）` }));
+
+  const applyUn = (cargoId: string, un: string) => {
+    const entry = UN_TABLE[un];
+    if (!entry) return;
+    dispatch(updateDeclaration({ cargoId, unNumber: un, category: entry.category, name: entry.name, segregationLevel: entry.segregation }));
+  };
+
+  return (
+    <div className="page">
+      <PageHeading
+        eyebrow="DG SEGREGATION / 隔离校核"
+        title="危险品申报 · 货物 · 货位 隔离校核"
+        description="按 UN 号取类别与隔离等级，比对同舱、相邻层与上下层货位；任一申报或货位一变，受影响箱子隔离结论即失效重算。"
+        actions={<Badge size="lg" color={segIssues.length ? 'red' : 'teal'} leftSection={<IconCircleCheck size={14} />}>{segIssues.length ? `${segIssues.length} 项隔离不足` : '隔离已清'}</Badge>}
+      />
+      {notice && (
+        <Alert color={noticeColor} variant="light" icon={<IconAlertTriangle size={16} />} withCloseButton onClose={() => dispatch(clearImportNotice())} mb="md">
+          {notice.message}
+        </Alert>
+      )}
+      <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="sm" mb="md">
+        {[
+          ['危险品箱', `${dgCargo.length} 票`, '已接申报与货位', 'ok'],
+          ['最高隔离等级', `${maxLevel} 级`, maxLevel >= 2 ? '须分舱 / 隔舱' : '同舱可装', maxLevel >= 2 ? 'bad' : 'ok'],
+          ['待处理隔离冲突', `${segIssues.length} 项`, segIssues.length ? '未清前不得锁定 / 打印' : '隔离已清', segIssues.length ? 'bad' : 'ok'],
+          ['危险品位排队', `${queueCount} 票`, queueCount ? '容量不足，先排队' : '无需等位', queueCount ? 'bad' : 'ok']
+        ].map((item) => <Card key={item[0]} padding="md" className="metric-card"><Text size="xs" c="dimmed">{item[0]}</Text><Text fw={800} fz={23} mt={3}>{item[1]}</Text><Text size="xs" c={item[3] === 'bad' ? 'red' : 'teal'}>{item[2]}</Text></Card>)}
+      </SimpleGrid>
+
+      <div className="dg-grid">
+        <Stack gap="sm">
+          <Card padding={0}>
+            <div className="panel-title"><div><strong>危险品申报与隔离等级</strong><Text size="xs" c="dimmed">按 UN 号取类别与隔离等级；改 UN 即触发受影响箱子重算</Text></div></div>
+            <ScrollArea>
+              <Table verticalSpacing="xs" className="dg-table">
+                <Table.Thead><Table.Tr><Table.Th>货物 / 货位</Table.Th><Table.Th>UN 号</Table.Th><Table.Th>类别</Table.Th><Table.Th>隔离等级</Table.Th><Table.Th>来源</Table.Th><Table.Th>状态</Table.Th><Table.Th>操作</Table.Th></Table.Tr></Table.Thead>
+                <Table.Tbody>
+                  {dgCargo.map((c) => {
+                    const decl = declarations.find((d) => d.id === c.declarationId);
+                    if (!decl) return null;
+                    const conc = conclusions[c.id];
+                    return (
+                      <Table.Tr key={c.id}>
+                        <Table.Td><Text fw={700} size="xs">{c.bill}</Text><Text size="xs" c="dimmed">{c.id} · {c.hold} · B{c.bay}/R{c.row}/T{c.tier}</Text></Table.Td>
+                        <Table.Td><Text size="xs">{decl.unNumber}</Text></Table.Td>
+                        <Table.Td>{decl.status === '缺类别' ? <Badge color="orange" size="xs">待补齐</Badge> : <Badge size="xs" variant="light">{decl.category} 类</Badge>}</Table.Td>
+                        <Table.Td><Badge size="xs" color={decl.segregationLevel >= 2 ? 'red' : 'teal'} variant="light">{decl.segregationLevel} 级</Badge></Table.Td>
+                        <Table.Td><Text size="xs" c="dimmed">{decl.source}</Text></Table.Td>
+                        <Table.Td><Badge size="xs" color={decl.status === '完整' ? 'teal' : 'orange'}>{decl.status}</Badge></Table.Td>
+                        <Table.Td>
+                          {decl.status === '缺类别' ? (
+                            <Group gap={4}>
+                              <Select size="xs" data={categoryOptions} placeholder="补类别" style={{ width: 92 }} onChange={(v) => v && dispatch(supplementCategory({ cargoId: c.id, category: v }))} />
+                            </Group>
+                          ) : (
+                            <Select size="xs" data={unOptions} value={decl.unNumber} style={{ width: 178 }} onChange={(v) => v && applyUn(c.id, v)} />
+                          )}
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
+                </Table.Tbody>
+              </Table>
+            </ScrollArea>
+          </Card>
+
+          <Card padding="0">
+            <div className="panel-title"><div><strong>隔离校核结论</strong><Text size="xs" c="dimmed">同舱 / 相邻层 / 上下层；受影响箱子重算，无关箱子沿用原结论</Text></div></div>
+            <div className="dg-conc-list">
+              {dgCargo.map((c) => {
+                const conc = conclusions[c.id];
+                const decl = declarations.find((d) => d.id === c.declarationId);
+                const relCount: Record<SegRelation, number> = { 同舱: 0, 相邻层: 0, 上下层: 0, 远舱: 0 };
+                conc?.segregation.issues.forEach((i) => { relCount[i.relation] += 1; });
+                const cacheLabel = conc && conc.recomputeCount > 0 ? `已重算 ${conc.recomputeCount} 次` : '沿用初始结论';
+                return (
+                  <div key={c.id} className="dg-conc">
+                    <div className="dg-conc-head">
+                      <Group gap={6}><Text fw={700} size="xs">{c.bill}</Text><Badge size="xs" color="orange">{decl?.unNumber}</Badge><Badge size="xs" variant="light">{decl?.category} 类</Badge></Group>
+                      <Group gap={6}><Badge size="xs" color={conc?.segregation.ok ? 'teal' : 'red'}>{conc?.segregation.ok ? '隔离通过' : `${conc?.segregation.issues.length} 项不足`}</Badge><Badge size="xs" variant="outline" color="gray">{cacheLabel}</Badge></Group>
+                    </div>
+                    <Group gap={6} mt={6}>
+                      {(['同舱', '相邻层', '上下层'] as const).map((rel) => (
+                        <Badge key={rel} size="xs" color={relCount[rel] ? 'red' : 'gray'} variant={relCount[rel] ? 'filled' : 'light'}>{rel} {relCount[rel]}</Badge>
+                      ))}
+                      <Badge size="xs" color={conc?.stacking.ok ? 'gray' : 'orange'} variant="light">堆码 {conc?.stacking.ok ? '正常' : `${conc?.stacking.issues.length}`}</Badge>
+                      <Badge size="xs" color={conc?.stability.ok ? 'gray' : 'orange'} variant="light">稳性 {conc?.stability.ok ? '正常' : `${conc?.stability.issues.length}`}</Badge>
+                      <Text size="xs" c="dimmed" ml="auto">校核于 {conc?.computedAt}</Text>
+                    </Group>
+                    {conc && !conc.segregation.ok && (
+                      <Stack gap={4} mt={6}>{conc.segregation.issues.map((i) => <Text key={i.id} size="xs" c="red">{i.text}</Text>)}</Stack>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        </Stack>
+
+        <Stack gap="sm">
+          <Card padding="md">
+            <div className="panel-title" style={{ padding: 0, border: 0, marginBottom: 8 }}><div><strong>码头申报导入</strong><Text size="xs" c="dimmed">按 UN 号导入类别与隔离等级</Text></div><IconFileImport size={18} /></div>
+            <Stack gap="xs">
+              <Select size="xs" label="导入到货物" data={cargoOptions} value={importCargoId} onChange={(v) => v && setImportCargoId(v)} />
+              <TextInput size="xs" label="UN 号" value={importUn} onChange={(e) => setImportUn(e.currentTarget.value)} />
+              <Button size="xs" color="teal" loading={importing} onClick={() => importDecl({ cargoId: importCargoId, unNumber: importUn })}>导入申报</Button>
+              <Divider label="模拟场景" labelPosition="center" />
+              <Group gap={6}>
+                <Button size="xs" variant="default" onClick={() => importDecl({ cargoId: importCargoId, unNumber: 'UN 0000' })}>导入失败重试</Button>
+                <Button size="xs" variant="default" onClick={() => importDecl({ cargoId: importCargoId, unNumber: 'UN 9999' })}>旧稿缺类别</Button>
+              </Group>
+              <Text size="xs" c="dimmed">导入失败保留原货位与旧申报，可重试；旧稿缺危险品类别时补齐后才能重排。</Text>
+            </Stack>
+          </Card>
+
+          <Card padding="md">
+            <div className="panel-title" style={{ padding: 0, border: 0, marginBottom: 8 }}><div><strong>危险品位容量与排队</strong><Text size="xs" c="dimmed">容量 {DG_CAPACITY_PER_HOLD} 票 / 舱，不足先排队并写明占用者</Text></div><IconClockHour4 size={18} /></div>
+            <Stack gap="xs">
+              {holdRows.map((row) => (
+                <div key={row.hold} className="dg-hold-row">
+                  <Group justify="space-between"><Text size="xs" fw={700}>{row.hold}</Text><Badge size="xs" color={row.items.length >= DG_CAPACITY_PER_HOLD ? 'red' : 'teal'} variant="light">{row.items.length}/{DG_CAPACITY_PER_HOLD}</Badge></Group>
+                  <Text size="xs" c="dimmed">{row.items.length ? row.items.map((c) => c.bill).join('、') : '暂无危险品箱'}</Text>
+                </div>
+              ))}
+              {state.queue.map((q) => {
+                const qc = cargo.find((c) => c.id === q.cargoId);
+                return (
+                  <div key={q.id} className="dg-queue">
+                    <Group justify="space-between"><Badge size="xs" color="orange">排队中</Badge><Text size="xs" c="dimmed">{q.requestedAt}</Text></Group>
+                    <Text size="xs" fw={700}>{qc?.bill} · {q.reason}</Text>
+                    <Text size="xs" c="dimmed">占用者：{q.occupantIds.map((oid) => cargo.find((c) => c.id === oid)?.bill ?? oid).join('、')}</Text>
+                    <Button size="xs" variant="default" onClick={() => dispatch(cancelQueue(q.id))}>取消排队</Button>
+                  </div>
+                );
+              })}
+              {!state.queue.length && <Text size="xs" c="teal">各舱危险品位均有空位。</Text>}
+            </Stack>
+          </Card>
+
+          <Card padding="md">
+            <div className="panel-title" style={{ padding: 0, border: 0, marginBottom: 8 }}><div><strong>两名值班员并发修改</strong><Text size="xs" c="dimmed">先到者占用，后到者留冲突</Text></div><IconArrowsExchange size={18} /></div>
+            <Stack gap="xs">
+              <Group justify="space-between"><Text size="xs" c="dimmed">当前值班员</Text><Badge size="xs" variant="light">{state.currentOfficer}</Badge></Group>
+              <Group justify="space-between"><Text size="xs" c="dimmed">{active.bill} 占用者</Text>{active.claimedBy ? <Badge size="xs" color="orange">{active.claimedBy}</Badge> : <Badge size="xs" color="gray">空闲</Badge>}</Group>
+              <Button size="xs" variant="default" leftSection={<IconUserCheck size={14} />} onClick={() => dispatch(simulateConcurrentEdit(active.id))}>模拟值班员·乙同时修改此货位</Button>
+              {active.claimedBy && active.claimedBy === state.currentOfficer && (
+                <Button size="xs" variant="subtle" onClick={() => dispatch(releaseClaim(active.id))}>释放占用</Button>
+              )}
+              <Divider label="并发冲突记录" labelPosition="center" />
+              {state.concurrency.map((cc) => (
+                <div key={cc.id} className="dg-cc">
+                  <Group justify="space-between"><Badge size="xs" color={cc.status === '待处理' ? 'red' : 'gray'}>{cc.status}</Badge><Text size="xs" c="dimmed">{cc.at}</Text></Group>
+                  <Text size="xs"><Text span fw={700}>{cc.firstOfficer}</Text> 先到占用 {cargo.find((c) => c.id === cc.cargoId)?.bill}，<Text span fw={700}>{cc.secondOfficer}</Text> 后到留冲突（目标 B{cc.position.bay}/R{cc.position.row}/T{cc.position.tier}）。</Text>
+                  {cc.status === '待处理' && <Button size="xs" variant="default" onClick={() => dispatch(acknowledgeConflict(cc.id))}>知悉</Button>}
+                </div>
+              ))}
+              {!state.concurrency.length && <Text size="xs" c="teal">暂无并发冲突。</Text>}
+            </Stack>
+          </Card>
+        </Stack>
+      </div>
+    </div>
+  );
 }
 
 function Compare() {
@@ -295,10 +506,14 @@ function PrintPlan() {
   const state = useSelector((root: RootState) => root.stowage);
   const stability = calculateStability(state.cargo);
   const dispatch = useDispatch();
+  const conflicts = detectConflicts(state.cargo, state.declarations, state.queue, state.conclusions);
+  const dgIssues = Object.values(state.conclusions).filter((c) => !c.segregation.ok).reduce((n, c) => n + c.segregation.issues.length, 0);
+  const canPrint = conflicts.length === 0 && dgIssues === 0;
   return <div className="page print-page">
-    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} onClick={() => window.print()}>打印配载包</Button></>} />
+    <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} disabled={!canPrint} onClick={() => canPrint && window.print()}>打印配载包</Button></>} />
+    {!canPrint && <Alert color="red" variant="light" icon={<IconLockOpen size={16} />} mb="md">危险品隔离尚未清干净（{dgIssues} 项隔离不足{conflicts.length ? `，${conflicts.length} 项冲突` : ''}），锁定并消除隔离前不得打印配载包。</Alert>}
     <Card padding="xl" className="print-sheet">
-      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />已校核</div></div>
+      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />{canPrint ? '已校核' : '隔离未清'}</div></div>
       <div className="print-kpis"><div><span>总货重</span><strong>{stability.total.toFixed(1)} t</strong></div><div><span>稳性裕度</span><strong>{stability.stability.toFixed(1)}%</strong></div><div><span>纵倾</span><strong>{stability.trim}</strong></div><div><span>主甲板载荷</span><strong>{stability.deckLoad.toFixed(1)} t</strong></div></div>
       <h3>主甲板配载图</h3>
       <div className="print-deck">{Array.from({ length: 28 }).map((_, index) => { const row = index % 4; const bay = 4 + Math.floor(index / 4); const item = state.cargo.find((cargo) => cargo.deck === '主甲板' && cargo.bay === bay && cargo.row === row); return <div key={index} className={item ? 'filled' : ''} style={item ? { borderTopColor: item.color } : undefined}><span>{item ? item.bill.slice(-3) : ''}</span><small>{item ? `${item.weight}t` : `B${bay}/R${row}`}</small>{item?.hazmat !== '无' && item && <b>DG</b>}</div>; })}</div>
@@ -320,5 +535,5 @@ function Shell({ children }: { children: ReactNode }) {
 }
 
 export default function App() {
-  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/compare" element={<Compare />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
+  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/dg" element={<DgPage />} /><Route path="/compare" element={<Compare />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
 }
